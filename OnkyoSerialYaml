@@ -1,0 +1,342 @@
+esphome:
+  name: onkyo-tx-sr706
+  friendly_name: Onkyo TX-SR706
+  on_boot:
+    priority: -100     # after uart/wifi/api are up
+    then:
+      - delay: 2s
+      - script.execute: query_all
+
+esp32:
+  board: esp32dev   # change to your exact board (e.g. esp32-c3-devkitm-1)
+  framework:
+    type: arduino
+
+# Keep native USB/serial logging off the RS232 UART - use a separate
+# hardware UART for logging, or drop to level NONE and rely on the API.
+logger:
+  baud_rate: 0       # disables logging on UART0 (usually pins 1/3)
+
+api:
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# ---------------------------------------------------------------------------
+# RS232 bus to the Onkyo. ISCP over RS232 = plain ASCII, 9600 8N1, no flow
+# control. Commands/responses look like: !1PWR01\r  !1MVL32\r  !1AMT01\r
+# ---------------------------------------------------------------------------
+uart:
+  id: onkyo_uart
+  tx_pin: GPIO17     # ESP32 TX -> MAX3232 T1IN/DIN
+  rx_pin:
+    number: GPIO4    # ESP32 RX <- MAX3232 R1OUT/ROUT (moved off GPIO16 -
+                      # suspected damaged from earlier bus contention - then
+                      # off GPIO34, which has no internal pull resistor and
+                      # picked up noise on the idle line)
+    mode:
+      input: true
+      pullup: true    # holds the line at a defined idle level between bytes
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+
+globals:
+  - id: rs232_buffer
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+# ---------------------------------------------------------------------------
+# Receive side: poll the UART, accumulate bytes until CR (0x0D), then hand
+# the completed line off for parsing. This is the standard pattern for
+# ASCII line protocols on ESPHome since the uart component has no built-in
+# "on line received" trigger.
+# ---------------------------------------------------------------------------
+interval:
+  - interval: 20ms
+    then:
+      - lambda: |-
+          while (id(onkyo_uart)->available()) {
+            uint8_t c;
+            id(onkyo_uart)->read_byte(&c);
+            if (c == '\r' || c == '\n') {
+              if (!id(rs232_buffer).empty()) {
+                id(handle_onkyo_line).execute(id(rs232_buffer));
+                id(rs232_buffer).clear();
+              }
+            } else if (c == '!' && !id(rs232_buffer).empty()) {
+              // A fresh reply started ('!') while we still had bytes
+              // buffered from a previous one - the terminator between them
+              // was likely corrupted/dropped. Flush what we have as its
+              // own line, then start the new one at this '!'.
+              id(handle_onkyo_line).execute(id(rs232_buffer));
+              id(rs232_buffer).clear();
+              id(rs232_buffer) += (char) c;
+            } else if (c >= 0x20 && c < 0x7F) {   // printable ASCII only
+              id(rs232_buffer) += (char) c;
+              if (id(rs232_buffer).size() > 32) id(rs232_buffer).clear(); // safety
+            }
+          }
+
+  # Periodic resync - self-corrects HA's shown state against reality (physical
+  # remote use, a missed ack, a protection trip). Confirmed working now that
+  # the parser tolerates the noise/framing issues that hid earlier replies.
+  - interval: 30s
+    then:
+      - script.execute: query_all
+
+script:
+  - id: handle_onkyo_line
+    parameters:
+      line: string
+    then:
+      - lambda: |-
+          ESP_LOGD("onkyo", "RX: %s", line.c_str());
+          id(onkyo_raw_response).publish_state(line);
+
+          // Tolerate leading garbage before the reply (line noise can
+          // prepend junk bytes) - find the actual start of the message
+          // instead of requiring it at position 0.
+          size_t start = line.find('!');
+          if (start == std::string::npos) return;
+          std::string clean = line.substr(start);
+          if (clean.size() < 6) return;
+          std::string cmd = clean.substr(2, 3);
+          std::string val = clean.substr(5);
+
+          if (cmd == "PWR") {
+            id(onkyo_power).publish_state(val == "01");
+          } else if (cmd == "AMT") {
+            id(onkyo_mute).publish_state(val == "01");
+          } else if (cmd == "MVL") {
+            // value is 2-digit hex, 00-64 -> 0-100
+            int hex_val = strtol(val.c_str(), nullptr, 16);
+            id(onkyo_volume).publish_state((float) hex_val);
+          } else if (cmd == "SLI") {
+            id(onkyo_input_raw).publish_state(val);
+            std::string name;
+            if (val == "10") name = "DVD";
+            else if (val == "00") name = "VCR/DVR";
+            else if (val == "01") name = "CBL/SAT";
+            else if (val == "02") name = "GAME/TV";
+            else if (val == "03") name = "AUX";
+            else if (val == "20") name = "TAPE";
+            else if (val == "22") name = "PHONO";
+            else if (val == "23") name = "CD";
+            else if (val == "26") name = "TUNER";
+            else if (val == "30") name = "MULTI CH";
+            if (!name.empty()) id(onkyo_input_select).publish_state(name);
+          }
+
+  # ---------------------------------------------------------------------------
+  # Send side helper: wraps a raw ISCP command with the "!1" prefix and CR.
+  # ---------------------------------------------------------------------------
+  - id: send_iscp
+    parameters:
+      command: string
+    then:
+      - lambda: |-
+          std::string msg = "!1" + command + "\r";
+          id(onkyo_uart)->write_str(msg.c_str());
+          ESP_LOGD("onkyo", "TX: %s", msg.c_str());
+
+  # ---------------------------------------------------------------------------
+  # Queries every tracked state at once. Used on boot, on a periodic timer,
+  # and by the manual "Query Status" button - so HA self-corrects instead of
+  # only ever updating on the (sometimes missed) ack of a command it sent.
+  # ---------------------------------------------------------------------------
+  - id: query_all
+    then:
+      - script.execute: {id: send_iscp, command: "PWRQSTN"}
+      - delay: 100ms
+      - script.execute: {id: send_iscp, command: "MVLQSTN"}
+      - delay: 100ms
+      - script.execute: {id: send_iscp, command: "AMTQSTN"}
+      - delay: 100ms
+      - script.execute: {id: send_iscp, command: "SLIQSTN"}
+
+# ---------------------------------------------------------------------------
+# Entities exposed to Home Assistant
+# ---------------------------------------------------------------------------
+text_sensor:
+  - platform: template
+    name: "Onkyo Raw Response"
+    id: onkyo_raw_response
+  - platform: template
+    name: "Onkyo Input (raw code)"
+    id: onkyo_input_raw
+
+switch:
+  - platform: template
+    name: "Onkyo Power"
+    id: onkyo_power
+    icon: mdi:power
+    optimistic: false
+    assumed_state: false
+    turn_on_action:
+      - script.execute:
+          id: send_iscp
+          command: "PWR01"
+    turn_off_action:
+      - script.execute:
+          id: send_iscp
+          command: "PWR00"
+
+  - platform: template
+    name: "Onkyo Mute"
+    id: onkyo_mute
+    icon: mdi:volume-mute
+    optimistic: false
+    assumed_state: false
+    turn_on_action:
+      - script.execute:
+          id: send_iscp
+          command: "AMT01"
+    turn_off_action:
+      - script.execute:
+          id: send_iscp
+          command: "AMT00"
+
+number:
+  - platform: template
+    name: "Onkyo Volume"
+    id: onkyo_volume
+    icon: mdi:volume-high
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    set_action:
+      - lambda: |-
+          char hex_buf[3];
+          snprintf(hex_buf, sizeof(hex_buf), "%02X", (int) x);
+          std::string cmd = std::string("MVL") + hex_buf;
+          id(send_iscp).execute(cmd);
+
+select:
+  - platform: template
+    name: "Onkyo Input"
+    id: onkyo_input_select
+    optimistic: false
+    # Matches the physical source buttons on the RC-717M remote, with the
+    # confirmed ISCP "SLI" codes for the TX-SR706 generation (from Onkyo's
+    # own ISCP Spec - Receivers technical doc).
+    options:
+      - "DVD"        # SLI10
+      - "VCR/DVR"    # SLI00
+      - "CBL/SAT"    # SLI01
+      - "GAME/TV"    # SLI02
+      - "AUX"        # SLI03
+      - "TAPE"       # SLI20
+      - "PHONO"      # SLI22
+      - "CD"         # SLI23
+      - "TUNER"      # SLI26
+      - "MULTI CH"   # SLI30
+    set_action:
+      - lambda: |-
+          std::string code;
+          if (x == "DVD") code = "SLI10";
+          else if (x == "VCR/DVR") code = "SLI00";
+          else if (x == "CBL/SAT") code = "SLI01";
+          else if (x == "GAME/TV") code = "SLI02";
+          else if (x == "AUX") code = "SLI03";
+          else if (x == "TAPE") code = "SLI20";
+          else if (x == "PHONO") code = "SLI22";
+          else if (x == "CD") code = "SLI23";
+          else if (x == "TUNER") code = "SLI26";
+          else if (x == "MULTI CH") code = "SLI30";
+          if (!code.empty()) id(send_iscp).execute(code);
+
+button:
+  - platform: template
+    name: "Onkyo Volume Up"
+    on_press:
+      - script.execute: {id: send_iscp, command: "MVLUP"}
+  - platform: template
+    name: "Onkyo Volume Down"
+    on_press:
+      - script.execute: {id: send_iscp, command: "MVLDOWN"}
+  - platform: template
+    name: "Onkyo OSD Home"
+    on_press:
+      - script.execute: {id: send_iscp, command: "OSDHOME"}
+  - platform: template
+    name: "Onkyo OSD Menu"
+    on_press:
+      - script.execute: {id: send_iscp, command: "OSDMENU"}
+  - platform: template
+    name: "Onkyo OSD Up"
+    on_press:
+      - script.execute: {id: send_iscp, command: "OSDUP"}
+  - platform: template
+    name: "Onkyo OSD Down"
+    on_press:
+      - script.execute: {id: send_iscp, command: "OSDDOWN"}
+  - platform: template
+    name: "Onkyo OSD Left"
+    on_press:
+      - script.execute: {id: send_iscp, command: "OSDLEFT"}
+  - platform: template
+    name: "Onkyo OSD Right"
+    on_press:
+      - script.execute: {id: send_iscp, command: "OSDRIGHT"}
+  - platform: template
+    name: "Onkyo OSD Enter"
+    on_press:
+      - script.execute: {id: send_iscp, command: "OSDENTER"}
+  - platform: template
+    name: "Onkyo OSD Exit"
+    on_press:
+      - script.execute: {id: send_iscp, command: "OSDEXIT"}
+  # Dedicated source buttons - unlike the "Onkyo Input" dropdown, a button
+  # press always fires regardless of what the UI currently shows as selected,
+  # so this can't get stuck the way tapping a select's default entry can.
+  - platform: template
+    name: "Onkyo Input DVD"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI10"}
+  - platform: template
+    name: "Onkyo Input VCR-DVR"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI00"}
+  - platform: template
+    name: "Onkyo Input CBL-SAT"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI01"}
+  - platform: template
+    name: "Onkyo Input GAME-TV"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI02"}
+  - platform: template
+    name: "Onkyo Input AUX"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI03"}
+  - platform: template
+    name: "Onkyo Input TAPE"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI20"}
+  - platform: template
+    name: "Onkyo Input PHONO"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI22"}
+  - platform: template
+    name: "Onkyo Input CD"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI23"}
+  - platform: template
+    name: "Onkyo Input TUNER"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI26"}
+  - platform: template
+    name: "Onkyo Input MULTI CH"
+    on_press:
+      - script.execute: {id: send_iscp, command: "SLI30"}
+  - platform: template
+    name: "Onkyo Query Status"
+    on_press:
+      - script.execute: query_all
